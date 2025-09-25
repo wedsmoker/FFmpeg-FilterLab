@@ -1,5 +1,5 @@
 
-#!/usr/bin/env python3
+
 """
 ffmpeg_filter_gui.py
 
@@ -705,4 +705,5 @@ def main():
     sys.exit(app.exec())
 
 if __name__ == '__main__':
+
     main()
