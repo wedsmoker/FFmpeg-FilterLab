@@ -1,0 +1,75 @@
+/* style.css */
+QMainWindow {
+    background-color: #121212;
+    color: #00ff88;
+}
+
+QWidget {
+    font-size: 14px;
+    font-family: "Consolas", "Courier New", monospace;
+}
+
+QPushButton {
+    background-color: #002244;
+    color: #00ff88;
+    border: 1px solid #00ff88;
+    padding: 8px 16px;
+    border-radius: 2px;
+    font-weight: bold;
+}
+
+QPushButton:hover {
+    background-color: #003366;
+    border: 1px solid #00ffaa;
+}
+
+QPushButton:pressed {
+    background-color: #001122;
+}
+
+QLineEdit, QTextEdit, QComboBox {
+    padding: 6px;
+    border: 1px solid #00ff88;
+    border-radius: 2px;
+    background-color: #0a0a0a;
+    color: #00ff88;
+    selection-background-color: #00ff88;
+}
+
+QListWidget {
+    border: 1px solid #00ff88;
+    border-radius: 2px;
+    background-color: #0a0a0a;
+    color: #00ff88;
+}
+
+QLabel {
+    font-weight: bold;
+    color: #00ff88;
+}
+
+QScrollBar:vertical {
+    border: 1px solid #00ff88;
+    background: #121212;
+    width: 10px;
+    margin: 0px;
+}
+
+QScrollBar::handle:vertical {
+    background: #00aa66;
+    min-height: 20px;
+}
+
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    background: none;
+    border: none;
+}
+
+QScrollBar::up-arrow:vertical, QScrollBar::down-arrow:vertical {
+    background: none;
+    border: none;
+}
+
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+    background: none;
+}

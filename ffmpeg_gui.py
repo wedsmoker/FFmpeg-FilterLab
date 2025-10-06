@@ -1,5 +1,5 @@
 
-
+#!/usr/bin/env python3
 """
 ffmpeg_filter_gui.py
 
@@ -13,6 +13,7 @@ Features:
 - Preview frame extraction using ffmpeg (shows still frame)
 - Save/load presets (JSON)
 - Basic validation and error handling
+- Batch processing with multiple output formats
 
 Dependencies: PySide6 (pip install PySide6)
 Requires ffmpeg and ffprobe available on PATH.
@@ -31,14 +32,17 @@ import threading
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional, Tuple
+from enum import Enum
+from pathlib import Path
 from PySide6.QtCore import Qt, QThread, Signal, Slot
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QFileDialog, QComboBox, QLineEdit, QTextEdit, QListWidget,
     QListWidgetItem, QMessageBox, QFormLayout, QSpinBox, QDoubleSpinBox,
-    QCheckBox, QFrame, QSplitter, QSizePolicy, QSlider
+    QCheckBox, QFrame, QSplitter, QSizePolicy, QSlider, QTabWidget,
+    QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar, QAbstractItemView
 )
-from PySide6.QtGui import QPixmap, QClipboard, QPalette
+from PySide6.QtGui import QPixmap, QClipboard, QPalette, QDragEnterEvent, QDropEvent
 
 # --- Filter metadata ---
 FILTER_DEFS: Dict[str, Dict[str, Any]] = {
@@ -94,6 +98,60 @@ FILTER_DEFS: Dict[str, Dict[str, Any]] = {
     }
 }
 
+# --- Output format presets ---
+OUTPUT_FORMATS: Dict[str, Dict[str, Any]] = {
+    "MP4 (H.264)": {
+        "extension": ".mp4",
+        "video_codec": "libx264",
+        "audio_codec": "aac",
+        "extra_args": ["-movflags", "+faststart"]
+    },
+    "MP4 (H.265/HEVC)": {
+        "extension": ".mp4",
+        "video_codec": "libx265",
+        "audio_codec": "aac",
+        "extra_args": ["-movflags", "+faststart"]
+    },
+    "MKV (H.264)": {
+        "extension": ".mkv",
+        "video_codec": "libx264",
+        "audio_codec": "aac",
+        "extra_args": []
+    },
+    "WebM (VP9)": {
+        "extension": ".webm",
+        "video_codec": "libvpx-vp9",
+        "audio_codec": "libopus",
+        "extra_args": ["-deadline", "good", "-cpu-used", "2"]
+    },
+    "AVI (MPEG-4)": {
+        "extension": ".avi",
+        "video_codec": "mpeg4",
+        "audio_codec": "mp3",
+        "extra_args": []
+    },
+    "MOV (ProRes)": {
+        "extension": ".mov",
+        "video_codec": "prores_ks",
+        "audio_codec": "pcm_s16le",
+        "extra_args": ["-profile:v", "2"]
+    },
+    "Copy Codecs": {
+        "extension": ".mp4",
+        "video_codec": "copy",
+        "audio_codec": "copy",
+        "extra_args": []
+    }
+}
+
+# --- Batch processing status ---
+class BatchStatus(Enum):
+    PENDING = "Pending"
+    PROCESSING = "Processing"
+    COMPLETED = "Completed"
+    FAILED = "Failed"
+    SKIPPED = "Skipped"
+
 # --- Helper dataclasses ---
 @dataclass
 class FilterInstance:
@@ -111,6 +169,15 @@ class FilterInstance:
                 val = str(v)
             pairs.append(f"{k}={val}")
         return f"{self.name}=" + ":".join(pairs)
+
+@dataclass
+class BatchFileItem:
+    input_path: str
+    output_path: str
+    format_preset: str
+    status: BatchStatus = BatchStatus.PENDING
+    progress: float = 0.0
+    error_message: str = ""
 
 # --- Command validation and fixing ---
 def validate_and_fix_ffmpeg_command(cmd: List[str]) -> Tuple[List[str], List[str]]:
@@ -204,6 +271,109 @@ class FFmpegWorker(QThread):
                     return None
         return None
 
+# --- Batch processing worker ---
+class BatchWorker(QThread):
+    file_started = Signal(int)  # file index
+    file_progress = Signal(int, float)  # file index, progress (0-1)
+    file_completed = Signal(int, bool, str)  # file index, success, error_message
+    batch_completed = Signal(int, int)  # successful count, failed count
+    log = Signal(str)
+
+    def __init__(self, batch_items: List[BatchFileItem], filter_chain: List[FilterInstance],
+                 extra_args: List[str], quality: int):
+        super().__init__()
+        self.batch_items = batch_items
+        self.filter_chain = filter_chain
+        self.extra_args = extra_args
+        self.quality = quality
+        self._should_stop = False
+
+    def run(self):
+        successful = 0
+        failed = 0
+
+        for idx, item in enumerate(self.batch_items):
+            if self._should_stop:
+                self.log.emit(f"Batch processing cancelled by user")
+                break
+
+            self.file_started.emit(idx)
+            self.log.emit(f"Processing: {os.path.basename(item.input_path)}")
+
+            try:
+                # Build command for this file
+                cmd = build_ffmpeg_command(
+                    item.input_path,
+                    item.output_path,
+                    self.filter_chain,
+                    self.extra_args,
+                    self.quality,
+                    item.format_preset
+                )
+
+                # Get duration for progress tracking
+                duration = probe_duration(item.input_path)
+
+                # Run ffmpeg
+                self.log.emit(f"Command: {' '.join(cmd)}")
+                proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+
+                while True:
+                    if self._should_stop:
+                        proc.terminate()
+                        self.log.emit(f"File processing cancelled: {os.path.basename(item.input_path)}")
+                        break
+
+                    line = proc.stderr.readline()
+                    if not line:
+                        break
+
+                    # Parse progress
+                    if "time=" in line and duration:
+                        try:
+                            t = self._parse_time_from_line(line)
+                            if t is not None:
+                                frac = min(max(t / duration, 0.0), 1.0)
+                                self.file_progress.emit(idx, frac)
+                        except Exception:
+                            pass
+
+                proc.wait()
+                returncode = proc.returncode
+
+                if returncode == 0:
+                    self.log.emit(f"Completed: {os.path.basename(item.output_path)}")
+                    self.file_completed.emit(idx, True, "")
+                    successful += 1
+                else:
+                    error_msg = f"FFmpeg exited with code {returncode}"
+                    self.log.emit(f"Failed: {os.path.basename(item.input_path)} - {error_msg}")
+                    self.file_completed.emit(idx, False, error_msg)
+                    failed += 1
+
+            except Exception as e:
+                error_msg = str(e)
+                self.log.emit(f"Error processing {os.path.basename(item.input_path)}: {error_msg}")
+                self.file_completed.emit(idx, False, error_msg)
+                failed += 1
+
+        self.batch_completed.emit(successful, failed)
+
+    def _parse_time_from_line(self, line: str) -> Optional[float]:
+        parts = line.split()
+        for p in parts:
+            if p.startswith("time="):
+                t = p.split("=", 1)[1].strip().rstrip(',')
+                try:
+                    h, m, s = t.split(":")
+                    return int(h) * 3600 + int(m) * 60 + float(s)
+                except Exception:
+                    return None
+        return None
+
+    def stop(self):
+        self._should_stop = True
+
 def check_ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
 
@@ -218,34 +388,60 @@ def probe_duration(path: str) -> Optional[float]:
         return None
 
 def build_ffmpeg_command(input_file: str, output_file: str, filter_chain: List[FilterInstance],
-                         extra_args: List[str], quality: int) -> List[str]:
+                         extra_args: List[str], quality: int, format_preset: Optional[str] = None) -> List[str]:
     filters = ",".join([f.to_filter_str() for f in filter_chain]) if filter_chain else None
     cmd = ["ffmpeg", "-y", "-i", input_file]
     if filters:
         cmd += ["-vf", filters]
-    
-    # Add quality/size control for video
-    if any(arg.startswith(('-c:v', '-vcodec')) for arg in extra_args):
-        # User specified video codec, don't override
+
+    # Handle format preset if provided (for batch processing)
+    if format_preset and format_preset in OUTPUT_FORMATS:
+        preset = OUTPUT_FORMATS[format_preset]
+        v_codec = preset.get("video_codec", "libx264")
+        a_codec = preset.get("audio_codec", "aac")
+        preset_extra = preset.get("extra_args", [])
+
+        # For copy codec, skip quality settings
+        if v_codec == "copy":
+            cmd += ["-c:v", "copy", "-c:a", "copy"]
+        else:
+            # Add quality-based encoding
+            if quality >= 80:
+                cmd += ["-c:v", v_codec, "-crf", "18", "-preset", "slow"]
+            elif quality >= 60:
+                cmd += ["-c:v", v_codec, "-crf", "23", "-preset", "medium"]
+            elif quality >= 40:
+                cmd += ["-c:v", v_codec, "-crf", "28", "-preset", "fast"]
+            else:
+                cmd += ["-c:v", v_codec, "-crf", "32", "-preset", "veryfast"]
+
+            cmd += ["-c:a", a_codec, "-strict", "-2", "-b:a", "128k"]
+
+        cmd += preset_extra
         cmd += extra_args
     else:
-        # Add quality-based encoding
-        if quality >= 80:
-            cmd += ["-c:v", "libx264", "-crf", "18", "-preset", "slow"]
-        elif quality >= 60:
-            cmd += ["-c:v", "libx264", "-crf", "23", "-preset", "medium"]
-        elif quality >= 40:
-            cmd += ["-c:v", "libx264", "-crf", "28", "-preset", "fast"]
+        # Original single-file mode logic
+        if any(arg.startswith(('-c:v', '-vcodec')) for arg in extra_args):
+            # User specified video codec, don't override
+            cmd += extra_args
         else:
-            cmd += ["-c:v", "libx264", "-crf", "32", "-preset", "veryfast"]
-        
-        # Add audio encoding if not specified
-        if not any(arg.startswith(('-c:a', '-acodec')) for arg in extra_args):
-            cmd += ["-c:a", "aac", "-strict", "-2", "-b:a", "128k"]
+            # Add quality-based encoding
+            if quality >= 80:
+                cmd += ["-c:v", "libx264", "-crf", "18", "-preset", "slow"]
+            elif quality >= 60:
+                cmd += ["-c:v", "libx264", "-crf", "23", "-preset", "medium"]
+            elif quality >= 40:
+                cmd += ["-c:v", "libx264", "-crf", "28", "-preset", "fast"]
+            else:
+                cmd += ["-c:v", "libx264", "-crf", "32", "-preset", "veryfast"]
 
-        # Add any other extra args
-        cmd += [arg for arg in extra_args if not arg.startswith(('-c:v', '-vcodec', '-c:a', '-acodec'))]
-    
+            # Add audio encoding if not specified
+            if not any(arg.startswith(('-c:a', '-acodec')) for arg in extra_args):
+                cmd += ["-c:a", "aac", "-strict", "-2", "-b:a", "128k"]
+
+            # Add any other extra args
+            cmd += [arg for arg in extra_args if not arg.startswith(('-c:v', '-vcodec', '-c:a', '-acodec'))]
+
     cmd += [output_file]
     fixed_cmd, warnings = validate_and_fix_ffmpeg_command(cmd)
     for warning in warnings:
@@ -321,16 +517,373 @@ class FilterEditor(QWidget):
                 params[k] = text
         return FilterInstance(name=name, params=params)
 
+class BatchProcessingWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.batch_items: List[BatchFileItem] = []
+        self.batch_worker: Optional[BatchWorker] = None
+
+        layout = QVBoxLayout(self)
+
+        # Top controls
+        controls_layout = QHBoxLayout()
+        self.add_files_btn = QPushButton("Add Files")
+        self.add_files_btn.clicked.connect(self.add_files)
+        self.remove_btn = QPushButton("Remove Selected")
+        self.remove_btn.clicked.connect(self.remove_selected)
+        self.clear_btn = QPushButton("Clear All")
+        self.clear_btn.clicked.connect(self.clear_all)
+        controls_layout.addWidget(self.add_files_btn)
+        controls_layout.addWidget(self.remove_btn)
+        controls_layout.addWidget(self.clear_btn)
+        controls_layout.addStretch()
+        layout.addLayout(controls_layout)
+
+        # Output directory and format
+        output_layout = QHBoxLayout()
+        output_layout.addWidget(QLabel("Output Directory:"))
+        self.output_dir = QLineEdit()
+        self.output_dir.setPlaceholderText("Leave empty to use input directory with '_converted' suffix")
+        self.output_dir.textChanged.connect(self.on_output_settings_changed)
+        output_layout.addWidget(self.output_dir)
+        self.browse_dir_btn = QPushButton("Browse")
+        self.browse_dir_btn.clicked.connect(self.browse_output_dir)
+        output_layout.addWidget(self.browse_dir_btn)
+
+        output_layout.addWidget(QLabel("Format:"))
+        self.format_combo = QComboBox()
+        self.format_combo.addItems(list(OUTPUT_FORMATS.keys()))
+        self.format_combo.currentTextChanged.connect(self.on_output_settings_changed)
+        output_layout.addWidget(self.format_combo)
+
+        self.update_paths_btn = QPushButton("Update Paths")
+        self.update_paths_btn.clicked.connect(self.on_output_settings_changed)
+        self.update_paths_btn.setToolTip("Manually update output paths for all pending files")
+        output_layout.addWidget(self.update_paths_btn)
+
+        layout.addLayout(output_layout)
+
+        # File list table
+        self.table = QTableWidget()
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels(["Input File", "Output File", "Format", "Status", "Progress"])
+        self.table.horizontalHeader().setStretchLastSection(False)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Fixed)
+        self.table.setColumnWidth(4, 150)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        layout.addWidget(self.table)
+
+        # Bottom controls
+        bottom_layout = QHBoxLayout()
+        self.start_batch_btn = QPushButton("Start Batch Processing")
+        self.start_batch_btn.clicked.connect(self.start_batch_processing)
+        self.stop_batch_btn = QPushButton("Stop")
+        self.stop_batch_btn.setEnabled(False)
+        self.stop_batch_btn.clicked.connect(self.stop_batch_processing)
+        bottom_layout.addWidget(self.start_batch_btn)
+        bottom_layout.addWidget(self.stop_batch_btn)
+        bottom_layout.addStretch()
+        layout.addLayout(bottom_layout)
+
+        # Log
+        layout.addWidget(QLabel("Batch Log:"))
+        self.log_view = QTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumHeight(150)
+        layout.addWidget(self.log_view)
+
+    def add_files(self):
+        files, _ = QFileDialog.getOpenFileNames(self, "Select video files")
+        if not files:
+            return
+
+        output_dir = self.output_dir.text().strip()
+        format_preset = self.format_combo.currentText()
+        extension = OUTPUT_FORMATS[format_preset]["extension"]
+
+        for file_path in files:
+            input_path_obj = Path(file_path)
+
+            # Generate output path
+            if output_dir:
+                # Use specified output directory
+                output_path = os.path.join(output_dir, input_path_obj.stem + extension)
+            else:
+                # No output directory specified - use same directory as input
+                # But add "_converted" suffix to avoid overwriting the original
+                if input_path_obj.suffix.lower() == extension.lower():
+                    # Same extension - add suffix to filename
+                    output_path = str(input_path_obj.parent / (input_path_obj.stem + "_converted" + extension))
+                else:
+                    # Different extension - just change extension
+                    output_path = str(input_path_obj.with_suffix(extension))
+
+            # Safety check: ensure output path is never same as input path
+            if os.path.normpath(output_path).lower() == os.path.normpath(file_path).lower():
+                output_path = str(input_path_obj.parent / (input_path_obj.stem + "_converted" + extension))
+
+            # Add to batch items
+            item = BatchFileItem(
+                input_path=file_path,
+                output_path=output_path,
+                format_preset=format_preset
+            )
+            self.batch_items.append(item)
+
+        self.refresh_table()
+
+    def remove_selected(self):
+        selected_rows = sorted(set(index.row() for index in self.table.selectedIndexes()), reverse=True)
+        for row in selected_rows:
+            if 0 <= row < len(self.batch_items):
+                del self.batch_items[row]
+        self.refresh_table()
+
+    def clear_all(self):
+        self.batch_items.clear()
+        self.refresh_table()
+
+    def browse_output_dir(self):
+        dir_path = QFileDialog.getExistingDirectory(self, "Select output directory")
+        if dir_path:
+            self.output_dir.setText(dir_path)
+
+    def on_output_settings_changed(self):
+        """Update output paths for all pending items when format or output directory changes"""
+        if not self.batch_items:
+            return
+
+        format_preset = self.format_combo.currentText()
+        if format_preset not in OUTPUT_FORMATS:
+            return
+
+        extension = OUTPUT_FORMATS[format_preset]["extension"]
+        output_dir = self.output_dir.text().strip()
+
+        updated_count = 0
+        for item in self.batch_items:
+            # Only update pending items (not processing/completed/failed)
+            if item.status == BatchStatus.PENDING:
+                item.format_preset = format_preset
+                input_path_obj = Path(item.input_path)
+
+                # Update output path with new settings
+                if output_dir:
+                    # Use specified output directory
+                    item.output_path = os.path.join(output_dir, input_path_obj.stem + extension)
+                else:
+                    # No output directory - add suffix if same extension
+                    if input_path_obj.suffix.lower() == extension.lower():
+                        item.output_path = str(input_path_obj.parent / (input_path_obj.stem + "_converted" + extension))
+                    else:
+                        item.output_path = str(input_path_obj.with_suffix(extension))
+
+                # Safety check: ensure output never overwrites input
+                if os.path.normpath(item.output_path).lower() == os.path.normpath(item.input_path).lower():
+                    item.output_path = str(input_path_obj.parent / (input_path_obj.stem + "_converted" + extension))
+
+                updated_count += 1
+
+        if updated_count > 0:
+            self.refresh_table()
+            self.log_view.append(f"Updated output paths for {updated_count} file(s)")
+
+    def refresh_table(self):
+        self.table.setRowCount(len(self.batch_items))
+        for row, item in enumerate(self.batch_items):
+            # Input file
+            input_item = QTableWidgetItem(os.path.basename(item.input_path))
+            input_item.setToolTip(item.input_path)  # Show full path on hover
+            self.table.setItem(row, 0, input_item)
+
+            # Output file
+            output_item = QTableWidgetItem(os.path.basename(item.output_path))
+            output_item.setToolTip(item.output_path)  # Show full path on hover
+            self.table.setItem(row, 1, output_item)
+
+            # Format
+            format_item = QTableWidgetItem(item.format_preset)
+            self.table.setItem(row, 2, format_item)
+
+            # Status
+            status_item = QTableWidgetItem(item.status.value)
+            if item.error_message:
+                status_item.setToolTip(item.error_message)  # Show error on hover
+            self.table.setItem(row, 3, status_item)
+
+            # Progress
+            progress_bar = QProgressBar()
+            progress_bar.setValue(int(item.progress * 100))
+            self.table.setCellWidget(row, 4, progress_bar)
+
+    def start_batch_processing(self):
+        if not self.batch_items:
+            QMessageBox.warning(self, "No Files", "Please add files to process first.")
+            return
+
+        # Validate that no output file will overwrite an input file
+        conflicts = []
+        for item in self.batch_items:
+            if os.path.normpath(item.output_path).lower() == os.path.normpath(item.input_path).lower():
+                conflicts.append(os.path.basename(item.input_path))
+
+        if conflicts:
+            QMessageBox.critical(
+                self,
+                "Output Path Conflict",
+                f"The following files have output paths identical to input paths:\n\n" +
+                "\n".join(conflicts) +
+                "\n\nThis would overwrite the original files. Please specify an output directory or change the format."
+            )
+            return
+
+        # Get filter chain and settings from main window
+        main_window = self.window()
+        if isinstance(main_window, MainWindow):
+            filter_chain = main_window.get_chain()
+            extra_args = main_window.extra_args.text().strip().split() if main_window.extra_args.text().strip() else []
+            quality = main_window.quality_slider.value()
+        else:
+            filter_chain = []
+            extra_args = []
+            quality = 70
+
+        # Reset all items to pending
+        for item in self.batch_items:
+            item.status = BatchStatus.PENDING
+            item.progress = 0.0
+            item.error_message = ""
+
+        self.refresh_table()
+        self.log_view.clear()
+
+        # Start batch worker
+        self.batch_worker = BatchWorker(self.batch_items, filter_chain, extra_args, quality)
+        self.batch_worker.file_started.connect(self.on_file_started)
+        self.batch_worker.file_progress.connect(self.on_file_progress)
+        self.batch_worker.file_completed.connect(self.on_file_completed)
+        self.batch_worker.batch_completed.connect(self.on_batch_completed)
+        self.batch_worker.log.connect(self.on_log)
+        self.batch_worker.start()
+
+        self.start_batch_btn.setEnabled(False)
+        self.stop_batch_btn.setEnabled(True)
+        self.add_files_btn.setEnabled(False)
+
+    def stop_batch_processing(self):
+        if self.batch_worker:
+            self.batch_worker.stop()
+            self.log_view.append("Stopping batch processing...")
+
+    @Slot(int)
+    def on_file_started(self, idx: int):
+        if 0 <= idx < len(self.batch_items):
+            self.batch_items[idx].status = BatchStatus.PROCESSING
+            self.refresh_table()
+
+    @Slot(int, float)
+    def on_file_progress(self, idx: int, progress: float):
+        if 0 <= idx < len(self.batch_items):
+            self.batch_items[idx].progress = progress
+            # Update just the progress bar
+            progress_bar = self.table.cellWidget(idx, 4)
+            if isinstance(progress_bar, QProgressBar):
+                progress_bar.setValue(int(progress * 100))
+
+    @Slot(int, bool, str)
+    def on_file_completed(self, idx: int, success: bool, error_msg: str):
+        if 0 <= idx < len(self.batch_items):
+            if success:
+                self.batch_items[idx].status = BatchStatus.COMPLETED
+                self.batch_items[idx].progress = 1.0
+            else:
+                self.batch_items[idx].status = BatchStatus.FAILED
+                self.batch_items[idx].error_message = error_msg
+            self.refresh_table()
+
+    @Slot(int, int)
+    def on_batch_completed(self, successful: int, failed: int):
+        self.start_batch_btn.setEnabled(True)
+        self.stop_batch_btn.setEnabled(False)
+        self.add_files_btn.setEnabled(True)
+
+        summary = f"\n=== Batch Processing Complete ===\n"
+        summary += f"Successful: {successful}\n"
+        summary += f"Failed: {failed}\n"
+        summary += f"Total: {successful + failed}\n"
+        self.log_view.append(summary)
+
+        # Find first successful output file to determine output directory
+        output_dir = None
+        if successful > 0:
+            for item in self.batch_items:
+                if item.status == BatchStatus.COMPLETED and os.path.exists(item.output_path):
+                    output_dir = os.path.dirname(item.output_path)
+                    break
+
+        # Ask user if they want to open output directory
+        if output_dir:
+            reply = QMessageBox.question(
+                self,
+                "Batch Processing Complete",
+                summary + "\nWould you like to open the output directory?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes
+            )
+
+            if reply == QMessageBox.Yes:
+                main_window = self.window()
+                if isinstance(main_window, MainWindow):
+                    main_window._open_directory(output_dir)
+        else:
+            QMessageBox.information(self, "Batch Complete", summary)
+
+    @Slot(str)
+    def on_log(self, message: str):
+        self.log_view.append(message)
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("FFmpeg FilterLab")
-        self.resize(1100, 700)
+        self.setWindowTitle("FFmpeg FilterLab - Single & Batch Processing")
+        self.resize(1200, 800)
+
+        # Set window icon
+        icon_path = self._get_resource_path("icon.ico")
+        if os.path.exists(icon_path):
+            from PySide6.QtGui import QIcon
+            self.setWindowIcon(QIcon(icon_path))
+
         self.container = QWidget()
         self.setCentralWidget(self.container)
         self.main_layout = QVBoxLayout(self.container)
 
-        # --- Top controls ---
+        # --- Shared Quality slider ---
+        quality_layout = QHBoxLayout()
+        quality_layout.addWidget(QLabel("Quality:"))
+        self.quality_slider = QSlider(Qt.Horizontal)
+        self.quality_slider.setRange(0, 100)
+        self.quality_slider.setValue(70)
+        self.quality_slider.valueChanged.connect(self.update_command_preview)
+        quality_layout.addWidget(self.quality_slider)
+        self.quality_label = QLabel("High (CRF 18)")
+        quality_layout.addWidget(self.quality_label)
+        self.main_layout.addLayout(quality_layout)
+
+        # --- Tab widget for Single/Batch modes ---
+        self.mode_tabs = QTabWidget()
+        self.main_layout.addWidget(self.mode_tabs)
+
+        # === Single File Mode Tab ===
+        single_widget = QWidget()
+        single_layout = QVBoxLayout(single_widget)
+
+        # Top controls for single mode
         top = QHBoxLayout()
         self.input_path = QLineEdit()
         self.in_btn = QPushButton("Open input")
@@ -344,19 +897,7 @@ class MainWindow(QMainWindow):
         top.addWidget(QLabel("Output:"))
         top.addWidget(self.output_path)
         top.addWidget(self.out_btn)
-        self.main_layout.addLayout(top)
-
-        # --- Quality slider ---
-        quality_layout = QHBoxLayout()
-        quality_layout.addWidget(QLabel("Quality:"))
-        self.quality_slider = QSlider(Qt.Horizontal)
-        self.quality_slider.setRange(0, 100)
-        self.quality_slider.setValue(70)
-        self.quality_slider.valueChanged.connect(self.update_command_preview)
-        quality_layout.addWidget(self.quality_slider)
-        self.quality_label = QLabel("High (CRF 18)")
-        quality_layout.addWidget(self.quality_label)
-        self.main_layout.addLayout(quality_layout)
+        single_layout.addLayout(top)
 
         # --- Split area: left editor, right preview and run ---
         split = QSplitter(Qt.Horizontal)
@@ -449,7 +990,14 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(QLabel("Log"))
         right_layout.addWidget(self.log_view)
         split.addWidget(right)
-        self.main_layout.addWidget(split)
+        single_layout.addWidget(split)
+
+        # Add single file tab
+        self.mode_tabs.addTab(single_widget, "Single File")
+
+        # === Batch Processing Mode Tab ===
+        self.batch_widget = BatchProcessingWidget(self)
+        self.mode_tabs.addTab(self.batch_widget, "Batch Processing")
 
         # --- State ---
         self.ffmpeg_thread: Optional[FFmpegWorker] = None
@@ -459,6 +1007,7 @@ class MainWindow(QMainWindow):
         self.chain_list.model().rowsInserted.connect(lambda: self.update_command_preview())
         self.chain_list.model().rowsRemoved.connect(lambda: self.update_command_preview())
         self.quality_slider.valueChanged.connect(self.update_command_preview)
+        self.quality_slider.valueChanged.connect(self.update_quality_label)
         self.update_command_preview()
         self.update_quality_label(self.quality_slider.value())
         if not check_ffmpeg_available():
@@ -655,7 +1204,20 @@ class MainWindow(QMainWindow):
         self.run_btn.setEnabled(True)
         self.abort_btn.setEnabled(False)
         if code == 0:
-            QMessageBox.information(self, "Done", "ffmpeg finished successfully.")
+            output_path = self.output_path.text().strip()
+
+            # Ask user if they want to open output directory
+            reply = QMessageBox.question(
+                self,
+                "Processing Complete",
+                "FFmpeg finished successfully!\n\nWould you like to open the output directory?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes
+            )
+
+            if reply == QMessageBox.Yes and output_path and os.path.exists(output_path):
+                output_dir = os.path.dirname(output_path)
+                self._open_directory(output_dir)
         else:
             QMessageBox.warning(self, "Finished", f"ffmpeg exited with code {code}")
 
@@ -667,6 +1229,18 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+    def _open_directory(self, directory: str):
+        """Open file explorer to the specified directory"""
+        try:
+            if sys.platform == 'win32':
+                os.startfile(directory)
+            elif sys.platform == 'darwin':
+                subprocess.Popen(['open', directory])
+            else:  # linux variants
+                subprocess.Popen(['xdg-open', directory])
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to open directory: {e}")
+
     def update_quality_label(self, value):
         if value >= 80:
             self.quality_label.setText("High (CRF 18)")
@@ -677,33 +1251,39 @@ class MainWindow(QMainWindow):
         else:
             self.quality_label.setText("Very Low (CRF 32)")
 
+    def _get_resource_path(self, relative_path):
+        """Get absolute path to resource, works for dev and for PyInstaller"""
+        try:
+            # PyInstaller creates a temp folder and stores path in _MEIPASS
+            base_path = sys._MEIPASS
+        except Exception:
+            base_path = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(base_path, relative_path)
+
 # --- Run ---
+def _get_resource_path(relative_path):
+    """Get absolute path to resource, works for dev and for PyInstaller"""
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_path, relative_path)
+
 def main():
     app = QApplication(sys.argv)
-    # Load stylesheet
-    if getattr(sys, 'frozen', False):
-        # running in a bundle
-        basedir = os.path.dirname(sys.executable)
-    else:
-        # running live
-        basedir = os.path.dirname(os.path.abspath(__file__))
-    
 
-    if getattr(sys, 'frozen', False):
-        # running in a bundle
-        basedir = sys._MEIPASS
-    stylesheet_path = os.path.join(basedir, "style.css")
+    # Load stylesheet
+    stylesheet_path = _get_resource_path("style.css")
     try:
         with open(stylesheet_path, "r") as f:
             app.setStyleSheet(f.read())
     except Exception as e:
-        pass
-
+        print(f"Warning: Could not load stylesheet: {e}")
 
     w = MainWindow()
     w.show()
     sys.exit(app.exec())
 
 if __name__ == '__main__':
-
     main()
